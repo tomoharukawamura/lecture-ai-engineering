@@ -16,12 +16,8 @@ from pyngrok import ngrok
 MODEL_NAME = "google/gemma-2-2b-jpn-it"  # お好みのモデルに変更可能です
 print(f"モデル名を設定: {MODEL_NAME}")
 
-# --- モデル設定クラス ---
-class Config:
-    def __init__(self, model_name=MODEL_NAME):
-        self.MODEL_NAME = model_name
-
-config = Config(MODEL_NAME)
+TEXT_SUMMRIZE_MODEL = "facebook/bart-large-cnn"  # テキスト分類モデルの設定
+print(f"要約モデル名を設定: {TEXT_SUMMRIZE_MODEL}")
 
 # --- FastAPIアプリケーション定義 ---
 app = FastAPI(
@@ -52,34 +48,61 @@ class SimpleGenerationRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
 
+class SummarizationRequest(BaseModel):
+    text: str
+    do_sample: Optional[bool] = False
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 0.9
+
 class GenerationResponse(BaseModel):
     generated_text: str
     response_time: float
 
 # --- モデル関連の関数 ---
 # モデルのグローバル変数
-model = None
-
-def load_model():
-    """推論用のLLMモデルを読み込む"""
-    global model  # グローバル変数を更新するために必要
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"使用デバイス: {device}")
-        pipe = pipeline(
-            "text-generation",
-            model=config.MODEL_NAME,
-            model_kwargs={"torch_dtype": torch.bfloat16},
-            device=device
-        )
-        print(f"モデル '{config.MODEL_NAME}' の読み込みに成功しました")
-        model = pipe  # グローバル変数を更新
-        return pipe
-    except Exception as e:
-        error_msg = f"モデル '{config.MODEL_NAME}' の読み込みに失敗: {e}"
-        print(error_msg)
-        traceback.print_exc()  # 詳細なエラー情報を出力
-        return None
+class Model_Manager:
+    def __init__(self):
+        self.chat_model = None
+        self.text_summarize_model = None
+    
+    def load_model(self, type, model_name):
+        """モデルを読み込む"""
+        try:
+            if type == "chat":
+                if self.chat_model.model.config._name_or_path == model_name:
+                    print("モデルはすでに読み込まれています。")
+                    return
+                print("chatモデルの読み込みを開始...")
+                self.chat_model = pipeline(
+                    "text-generation",
+                    model=model_name,
+                    device=0 if torch.cuda.is_available() else -1,
+                    max_length=512,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9
+                )
+                print("モデルの読み込みが完了しました。")
+            if type == "summarization":
+                if self.text_summarize_model.model.config._name_or_path == model_name:
+                    print("要約モデルはすでに読み込まれています。")
+                    return
+                print("要約モデルの読み込みを開始...")
+                self.text_summarize_model = pipeline(
+                    "summarization",
+                    model=model_name,
+                    device=0 if torch.cuda.is_available() else -1,
+                    max_length=300,
+                    do_sample=True
+                )
+                print("要約モデルの読み込みが完了しました。")
+        except Exception as e:
+            print(f"モデルの読み込み中にエラーが発生しました: {e}")
+            traceback.print_exc()
+            self.chat_model = None
+            self.text_summarize_model = None
+global model
+model = Model_Manager()
 
 def extract_assistant_response(outputs, user_prompt):
     """モデルの出力からアシスタントの応答を抽出する"""
@@ -134,8 +157,9 @@ def extract_assistant_response(outputs, user_prompt):
 @app.on_event("startup")
 async def startup_event():
     """起動時にモデルを初期化"""
-    load_model_task()  # バックグラウンドではなく同期的に読み込む
-    if model is None:
+    model.load_model("chat", MODEL_NAME)  # バックグラウンドではなく同期的に読み込む
+    model.load_model("summarization", TEXT_SUMMRIZE_MODEL)
+    if model.chat_model is None or model.text_summarize_model is None:
         print("警告: 起動時にモデルの初期化に失敗しました")
     else:
         print("起動時にモデルの初期化が完了しました。")
@@ -148,24 +172,19 @@ async def root():
 @app.get("/health")
 async def health_check():
     """ヘルスチェックエンドポイント"""
-    global model
-    if model is None:
-        return {"status": "error", "message": "No model loaded"}
-
-    return {"status": "ok", "model": config.MODEL_NAME}
+    models = []
+    models.append({"status": "error", "message": "モデルが読み込まれていません。"} if model.chat_model is None else {"status": "ok", "message": "モデルが正常に読み込まれています。"})
+    models.append({"status": "error", "message": "要約モデルが読み込まれていません。"} if model.text_summarize_model is None else {"status": "ok", "message": "要約モデルが正常に読み込まれています。"})
+    return models
 
 # 簡略化されたエンドポイント
 @app.post("/generate", response_model=GenerationResponse)
 async def generate_simple(request: SimpleGenerationRequest):
     """単純なプロンプト入力に基づいてテキストを生成"""
-    global model
 
-    if model is None:
+    if model.chat_model is None:
         print("generateエンドポイント: モデルが読み込まれていません。読み込みを試みます...")
-        load_model_task()  # 再度読み込みを試みる
-        if model is None:
-            print("generateエンドポイント: モデルの読み込みに失敗しました。")
-            raise HTTPException(status_code=503, detail="モデルが利用できません。後でもう一度お試しください。")
+        raise HTTPException(status_code=503, detail="モデルが利用できません。後でもう一度お試しください。")
 
     try:
         start_time = time.time()
@@ -182,8 +201,42 @@ async def generate_simple(request: SimpleGenerationRequest):
         )
         print("モデル推論が完了しました。")
 
+        end_time = time.time()
+        response_time = end_time - start_time
+        print(f"応答生成時間: {response_time:.2f}秒")
+
+        return GenerationResponse(
+            generated_text=outputs[0].summary_text,
+            response_time=response_time
+        )
+
+    except Exception as e:
+        print(f"シンプル応答生成中にエラーが発生しました: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"応答の生成中にエラーが発生しました: {str(e)}")
+    
+@app.post("/summarize", response_model=GenerationResponse)
+async def summarize_text(request:SummarizationRequest):
+    summarization_model = model.text_summarize_model
+    if summarization_model is None:
+        print("summarizeエンドポイント: 要約モデルが読み込まれていません。")
+        raise HTTPException(status_code=503, detail="要約モデルが利用できません。後でもう一度お試しください。")
+    try:
+        start_time = time.time()
+        print(f"要約リクエストを受信: text={request.text[:100]}..., do_sample={request.do_sample}")  # 長いテキストは切り捨て
+
+        # 要約モデルを使用して要約を生成
+        print("要約モデル推論を開始...")
+        outputs = summarization_model(
+            request.text,
+            do_sample=request.do_sample,
+            temperature=request.temperature,
+            top_p=request.top_p,
+        )
+        print("要約モデル推論が完了しました。")
+
         # アシスタント応答を抽出
-        assistant_response = extract_assistant_response(outputs, request.prompt)
+        assistant_response = extract_assistant_response(outputs, request.text)
         print(f"抽出されたアシスタント応答: {assistant_response[:100]}...")  # 長い場合は切り捨て
 
         end_time = time.time()
@@ -194,11 +247,11 @@ async def generate_simple(request: SimpleGenerationRequest):
             generated_text=assistant_response,
             response_time=response_time
         )
-
     except Exception as e:
-        print(f"シンプル応答生成中にエラーが発生しました: {e}")
+        print(f"要約応答生成中にエラーが発生しました: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"応答の生成中にエラーが発生しました: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"要約の生成中にエラーが発生しました: {str(e)}")
+
 
 def load_model_task():
     """モデルを読み込むバックグラウンドタスク"""
