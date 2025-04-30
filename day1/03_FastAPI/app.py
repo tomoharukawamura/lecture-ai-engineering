@@ -252,19 +252,6 @@ async def summarize_text(request:SummarizationRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"要約の生成中にエラーが発生しました: {str(e)}")
 
-
-def load_model_task():
-    """モデルを読み込むバックグラウンドタスク"""
-    global model
-    print("load_model_task: モデルの読み込みを開始...")
-    # load_model関数を呼び出し、結果をグローバル変数に設定
-    loaded_pipe = load_model()
-    if loaded_pipe:
-        model = loaded_pipe  # グローバル変数を更新
-        print("load_model_task: モデルの読み込みが完了しました。")
-    else:
-        print("load_model_task: モデルの読み込みに失敗しました。")
-
 print("FastAPIエンドポイントを定義しました。")
 
 # --- ngrokでAPIサーバーを実行する関数 ---
